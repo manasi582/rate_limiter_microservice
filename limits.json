@@ -1,0 +1,14 @@
+{
+  "user_123": {
+    "limit": 100,
+    "window_seconds": 60
+  },
+  "user_456": {
+    "limit": 10,
+    "window_seconds": 10
+  },
+  "default": {
+    "limit": 5,
+    "window_seconds": 10
+  }
+}
