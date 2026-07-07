@@ -1,207 +1,113 @@
-# Rate Limiter as a Service
+# Rate Limiter Microservice 🚦
 
-A high-performance, standalone rate-limiting microservice built using **Node.js, Express, TypeScript, Redis, and PostgreSQL**. 
+A simple API rate limiter I built to understand how real-world systems like GitHub, Twitter, and Stripe prevent users from spamming their APIs. It uses the **Sliding Window Log** algorithm with Redis to accurately track and limit requests.
 
-This service acts as an API guardian for your backend ecosystem. Downstream services query the `/check` endpoint of this service before processing client requests to guarantee that clients do not exceed their configured rates.
+## What is a Rate Limiter?
 
----
+A rate limiter is basically a bouncer for your API. It checks every incoming request and decides: "Has this user made too many requests recently? If yes, block them."
 
-## 1. Problem Statement
-This service protects backend infrastructure from degradation, abuse, and resource exhaustion by enforcing request rate ceilings per client ID. It guarantees that clients cannot exceed their configured limits (e.g. 100 requests per minute) under any circumstances, including concurrent requests or attacks distributed across multiple application nodes. It manages rate-limiting states globally in a centralized Redis store while caching rules locally to maintain sub-5ms lookup speeds.
+This project implements that as a standalone microservice — any backend can call it to check if a request should be allowed or blocked.
 
----
+## The Algorithm — Sliding Window Log
 
-## 2. Rate Limiting Algorithms Comparison
+I used the **Sliding Window Log** algorithm because it's more accurate than the basic fixed-window approach (which has a known "boundary spike" bug where users can double their limit at the edge of a window).
 
-This project implements three standard rate limiting algorithms with distinct trade-offs:
+Here's how it works:
 
-| Algorithm | How it Works | Pros | Cons |
-|---|---|---|---|
-| **Fixed Window Counter** | Divides time into static blocks (e.g., minutes). Each client gets an integer counter per block. | Minimal memory footprint (1 integer key per client per window). | **Boundary Spike Bug**: Allows double the rate limit near window boundaries. |
-| **Sliding Window Log** | Stores a timestamped log (using Redis Sorted Sets) of every request. Removes expired timestamps on each check. | 100% accurate rolling window coverage; prevents boundary spikes. | Memory-heavy. Storing every request timestamp does not scale well for high-throughput clients (e.g., 10,000 req/min). |
-| **Token Bucket** | Virtual bucket filled with tokens at a constant refill rate up to a max capacity. Every request consumes 1 token. | Production standard (used by AWS/Nginx). Allows short traffic bursts while strictly capping the long-term average rate. | Slightly higher implementation complexity. |
+![Sliding Window Log Diagram](assets/sliding_window_diagram.png)
 
----
+**The idea:**
+- Every request is logged with a timestamp in Redis (a sorted set).
+- When a new request comes in, we delete all old timestamps that are older than the time window (e.g., older than 10 seconds).
+- We then count what's left. If the count is under the limit → **allow it**. If not → **block it**.
+- The window "slides" with real time, so there's no cheating at window boundaries.
 
-## 3. The Boundary Spike Bug & Proof
+To make this thread-safe (no race conditions when two requests arrive at the same millisecond), I wrote the logic as a **Lua script** that runs directly inside Redis atomically.
 
-### What is the Boundary Spike Bug?
-In a naive **Fixed Window Counter**, if a client has a limit of 10 requests per 10 seconds, they can send 10 requests at the very end of Window A (e.g. at `t = 9s`) and another 10 requests at the very start of Window B (e.g. at `t = 11s`). This means the client successfully fired **20 requests in a 2-second period**, effectively doubling the configured rate limit. 
+## Tech Stack
 
-### How We Proved It
-We wrote a test script (`scripts/test_boundary_spike.ts`) that targets a client configured for `10 requests / 10 seconds`. The test waits until the final 1.5 seconds of the current window, fires 10 requests, waits for the rollover, and immediately fires another 10 requests.
+- **Node.js + TypeScript** — Backend server
+- **Express.js** — API framework
+- **Redis** — Stores request timestamps
+- **Docker** — Runs Redis in a container
+- **Lua** — Custom script for atomic Redis operations
 
-Here is the actual output from our test suite run:
+## Project Structure
 
 ```
-=== RATE LIMITER ALGORITHM COMPARISON SUITE ===
-
---- Running Test: Naive Fixed Window ---
-Sending Wave 1 (10 requests) in the final 1419ms of current window...
-Wave 1: 10/10 allowed.
-Waiting for window rollover (1910ms)...
-Sending Wave 2 (10 requests) immediately in the new window...
-Wave 2: 10/10 allowed.
-Finished Naive Fixed Window. Total allowed: 20/20
-
---- Running Test: Correct Fixed Window (Multi/Exec) ---
-Sending Wave 1 (10 requests) in the final 1499ms of current window...
-Wave 1: 10/10 allowed.
-Waiting for window rollover (1974ms)...
-Sending Wave 2 (10 requests) immediately in the new window...
-Wave 2: 10/10 allowed.
-Finished Correct Fixed Window (Multi/Exec). Total allowed: 20/20
-
---- Running Test: Sliding Window Log (Lua) ---
-Sending Wave 1 (10 requests) in the final 1401ms of current window...
-Wave 1: 10/10 allowed.
-Waiting for window rollover (1886ms)...
-Sending Wave 2 (10 requests) immediately in the new window...
-Wave 2: 0/10 allowed.
-Finished Sliding Window Log (Lua). Total allowed: 10/20
-
---- Running Test: Token Bucket (Lua) ---
-Sending Wave 1 (10 requests) in the final 1489ms of current window...
-Wave 1: 10/10 allowed.
-Waiting for window rollover (1980ms)...
-Sending Wave 2 (10 requests) immediately in the new window...
-Wave 2: 1/10 allowed.
-Finished Token Bucket (Lua). Total allowed: 11/20
-
-==================================================
-                  FINAL RESULTS                   
-==================================================
-Configured limit: 10 requests per 10 seconds.
-Test sent 20 requests spanning the window boundary (10 at end, 10 at start).
-
-Algorithm Name                      | Allowed Requests
--------------------------------------------------------
-Naive Fixed Window                  | 20 / 20 ✗ (Boundary Spike!)
-Correct Fixed Window (Multi/Exec)   | 20 / 20 ✗ (Boundary Spike!)
-Sliding Window Log (Lua)            | 10 / 20 ✓ (Throttled Correctly)
-Token Bucket (Lua)                  | 11 / 20 ✓ (Throttled Correctly - 1 refilled naturally over 2s)
-==================================================
+rate_limiter/
+├── docker-compose.yml     # Runs Redis
+├── limits.json            # Per-user rate limit config
+├── src/
+│   ├── index.ts           # Express API server
+│   ├── redis.ts           # Redis connection
+│   └── rateLimiter.ts     # Sliding Window algorithm (Lua)
+└── scripts/
+    └── test_limiter.ts    # Test script
 ```
 
-### Analysis of the Fixes
-* **Sliding Window Log** prevents the boundary spike entirely because request counts are evaluated on a true sliding window. Only 10 requests are allowed in any 10-second rolling interval, rejecting Wave 2 completely.
-* **Token Bucket** allowed 11/20. Because the rollover took 2 seconds, the bucket naturally refilled by `2 seconds * (10 tokens / 10 seconds) = 2 tokens`. It allowed 1 request from Wave 2 (leaving the bucket empty), confirming its math functions correctly.
+## Configuration
 
----
+Rate limits are set per user in `limits.json`. No database needed!
 
-## 4. Redis Atomicity & Lua Scripting
+![limits.json config](assets/limits_config.png)
 
-### The Naive Race Condition
-A naive implementation uses two commands:
-1. `INCR rate:user_123:timestamp`
-2. `EXPIRE rate:user_123:timestamp 60`
+Any user not listed falls back to the `default` rule.
 
-Under high concurrency, multiple server threads can run `INCR` concurrently before any thread sets the `EXPIRE` directive. If a network blip or process crash occurs between these two commands, the key is left with **no TTL**, causing the counter to live forever and permanently blocking the user.
+## How to Run
 
-### Why Lua Scripts Solve This
-Redis executes Lua scripts **atomically** on a single thread. No other command can run between the first and last line of a Lua script. 
-1. **Sliding Window Log**: Reading the sorted set size, purging expired timestamps, adding the new timestamp, and setting key TTL must be done as a single atomic unit. If not, two concurrent requests can both read `ZCARD = 9` (under a limit of 10), both write a new timestamp, and push the actual count to 11.
-2. **Token Bucket**: The read-compute-write cycle (calculating elapsed time, refilling tokens, decrementing tokens, updating hash) must run atomically. Running this in a Lua script avoids application-level locks and guarantees correctness.
-
----
-
-## 5. System Setup
-
-### Prerequisites
-* Docker & Docker Compose
-* Node.js & NPM
-
-### Spin Up Infrastructure (PostgreSQL & Redis)
-Exposes Postgres on port `5433` (to avoid conflicts with local Postgres installs) and Redis on port `6379`:
+**1. Start Redis:**
 ```bash
-docker-compose up -d
+docker compose up -d
 ```
 
-### Run the Application (Locally)
+**2. Start the server:**
 ```bash
 npm install
 npm run dev
 ```
 
-### Run Verification Test Suites
-* **Algorithm Boundary Spike Comparison**:
-  ```bash
-  npm run test:boundary
-  ```
-* **Concurrency Stress Test**:
-  ```bash
-  npm run test:concurrency
-  ```
+**3. Test the rate limiter (in a new terminal):**
+```bash
+npm test
+```
 
----
+## Test Output
 
-## 6. API Reference
+Here's what the test looks like when you run it:
 
-All successful and rejected responses return RFC 6585 standard rate limit headers:
-* `X-RateLimit-Limit`: Maximum allowed requests in the window.
-* `X-RateLimit-Remaining`: Remaining request capacity for the client in the current window.
-* `X-RateLimit-Reset`: Unix timestamp (in seconds) when the rate limit completely resets.
-* `Retry-After`: (Only on HTTP 429) Number of seconds the client must wait before making another request.
+![Test output](assets/test_output.png)
 
-### Core - Rate Limit Check
-* **Endpoint**: `POST /check`
-* **Headers**: `Content-Type: application/json`
-* **Body**:
-  ```json
-  {
-    "client_id": "user_123",
-    "action": "api_call"
-  }
-  ```
+The test:
+1. Fires 10 requests instantly → all **ALLOWED** ✅
+2. Fires 2 more immediately → both **BLOCKED** ❌ (limit hit)
+3. Waits 10 seconds for the window to expire
+4. Fires 1 final request → **ALLOWED** ✅ (fresh window)
 
-* **Response - Allowed (200 OK)**:
-  ```json
-  {
-    "allowed": true,
-    "limit": 100,
-    "remaining": 99,
-    "reset_at": 1720000060
-  }
-  ```
+## API Usage
 
-* **Response - Throttled (429 Too Many Requests)**:
-  ```json
-  {
-    "allowed": false,
-    "limit": 100,
-    "remaining": 0,
-    "reset_at": 1720000060,
-    "retry_after": 17
-  }
-  ```
+**POST `/check`**
 
-### Configuration CRUD
-* `POST /configs`: Create a config.
-  ```json
-  {
-    "client_id": "api_key_abc",
-    "algorithm": "token_bucket",
-    "limit": 100,
-    "window_seconds": 60,
-    "burst_capacity": 150,
-    "refill_rate": 2.5
-  }
-  ```
-* `GET /configs`: List configs.
-* `GET /configs/:id`: Get a specific config.
-* `PATCH /configs/:id`: Update a config.
-* `DELETE /configs/:id`: Soft delete/deactivate a config.
+```bash
+curl -X POST http://localhost:3000/check \
+  -H "Content-Type: application/json" \
+  -d '{"client_id": "user_456"}'
+```
 
-### Observability & Metrics
-* `GET /health`: Connects to Postgres and Redis to verify connection health.
-* `GET /metrics`: Global metrics (total checks, total rejections, global rejection %).
-* `GET /metrics/:client_id`: Per-client statistics and a list of the last 100 rejection events.
+**Allowed response:**
+```json
+{
+  "message": "Request allowed",
+  "allowed": true,
+  "remaining": 9
+}
+```
 
----
-
-## 7. Scaling to Production
-
-To scale this service to handle millions of requests per second:
-1. **Redis Sharding (Redis Cluster)**: Shard the Redis instance by client ID. The application can hash `client_id` (e.g., MurmurHash3) to route checks to specific Redis shards.
-2. **Local Cache invalidation via Redis Pub/Sub**: We implemented this in our node app! Local API servers cache configurations in-memory to bypass Postgres DB reads for every `/check` call. When a config changes via a CRUD endpoint, the updating node publishes a message to a Redis Pub/Sub channel, prompting all node instances to invalidate their local config cache instantly.
-3. **Local Token Pre-allocation**: For extreme scale, local API instances can lease/pre-allocate blocks of tokens (e.g., 50 tokens at a time) from Redis, checking requests locally and syncing the remainder back asynchronously. This lowers Redis network load by 95% at the cost of slight rate-limit elasticity.
+**Blocked response (HTTP 429):**
+```json
+{
+  "error": "Too Many Requests",
+  "allowed": false,
+  "remaining": 0
+}
+```
